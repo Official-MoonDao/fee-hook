@@ -157,7 +157,6 @@ contract FeeHook is BaseHook, OApp  {
         PoolId id = PoolId.wrap(poolId);
         uint256 tokenId = TOKEN_ID[id];
         require(tokenId != 0, "Token ID not found");
-        TOKEN_ID[id] = 0;
         transferredPoolIds.push(poolId);
         PositionManager(payable(address(posm))).safeTransferFrom(address(this), to, tokenId, "");
     }

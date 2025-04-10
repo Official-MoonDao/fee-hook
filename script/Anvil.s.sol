@@ -203,22 +203,21 @@ contract CounterScript is Script, DeployPermit2 {
         uint256 balanceAfter = address(deployerAddress).balance;
         console.log("Balance before: ", balanceBefore);
         console.log("Balance after: ", balanceAfter);
+        console.log('ownerOf: ', PositionManager(payable(address(posm))).ownerOf(feeHook.TOKEN_ID(poolKey.toId())));
 
         feeHook.transferPosition(
             deployerAddress,
             PoolId.unwrap(poolKey.toId())
         );
+        console.log('ownerOf: ', PositionManager(payable(address(posm))).ownerOf(feeHook.TOKEN_ID(poolKey.toId())));
         uint256 tokenId = feeHook.TOKEN_ID(poolKey.toId());
 
 
-        bytes memory actions = abi.encodePacked(
-            Actions.BURN_POSITION,
-            Actions.TAKE_PAIR
-        );
-        bytes[] memory params = new bytes[](2);
+        bytes memory burnActions = abi.encodePacked(uint8(Actions.BURN_POSITION), uint8(Actions.TAKE_PAIR));
+        bytes[] memory burnParams = new bytes[](2);
 
         // Parameters for BURN_POSITION
-        params[0] = abi.encode(
+        burnParams[0] = abi.encode(
             tokenId,      // Position to burn
             0,   // Minimum token0 to receive
             0,   // Minimum token1 to receive
@@ -226,18 +225,17 @@ contract CounterScript is Script, DeployPermit2 {
         );
 
         // Parameters for TAKE_PAIR - where tokens will go
-        params[1] = abi.encode(
+        burnParams[1] = abi.encode(
             poolKey.currency0,   // First token
             poolKey.currency1,   // Second token
             deployerAddress    // Who receives the tokens
         );
         posm.modifyLiquidities(
-            abi.encode(actions, params),
+            abi.encode(burnActions, burnParams),
             block.timestamp + 60
         );
-                //feeHook.withdrawFees();
-        //uint256 balanceAfter2 = address(deployerAddress).balance;
-        //console.log("Balance after 2: ", balanceAfter2);
+        uint256 balanceAfter2 = address(deployerAddress).balance;
+        console.log("Balance after 2: ", balanceAfter2);
 
 
     }
