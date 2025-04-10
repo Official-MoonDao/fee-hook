@@ -4,16 +4,21 @@ pragma solidity ^0.8.24;
 import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
 
 import "forge-std/console.sol";
+import { OptionsBuilder } from "@layerzerolabs/oapp-evm/contracts/oapp/libs/OptionsBuilder.sol";
 
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Actions} from "v4-periphery/src/libraries/Actions.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {StateView} from "v4-periphery/src/lens/StateView.sol";
 
 import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {BalanceDelta, toBalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
+import { OApp, Origin, MessagingFee } from "@layerzerolabs/oapp-evm/contracts/oapp/OApp.sol";
 
 
 interface IERC20 {
@@ -22,28 +27,31 @@ interface IERC20 {
 }
 
 
-contract Counter is BaseHook {
+contract FeeHook is BaseHook, OApp {
     using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
-    // NOTE: ---------------------------------------------------------
-    // state variables should typically be unique to a pool
-    // a single hook contract should be able to service multiple pools
-    // ---------------------------------------------------------------
-
-    mapping(PoolId => uint256 count) public beforeSwapCount;
-    mapping(PoolId => uint256 count) public afterSwapCount;
-
-    mapping(PoolId => uint256 count) public beforeAddLiquidityCount;
-    mapping(PoolId => uint256 count) public beforeRemoveLiquidityCount;
     mapping(PoolId => mapping(address => uint256)) public totalWithdrawnPerUser;
     mapping(PoolId => uint256) public totalWithdrawn;
+    uint256 public totalReceived;
+    mapping(PoolId => uint256) public NATIVE_FEES;
+    mapping(PoolId => uint256) public TOKEN_ID;
 
     IPositionManager posm;
+    // FIXME increase this
+    uint256 MIN_WITHDRAW = 0.0001 ether;
+    uint256 destinationChainId;
+    uint32 destinationEid; // LayerZero endpoint ID for the destination chain
+    address public vMooneyAddress;
 
-    constructor(IPoolManager _poolManager, IPositionManager _posm) BaseHook(_poolManager) {
+
+
+    constructor(IPoolManager _poolManager, IPositionManager _posm, address _lzEndpoint, uint256 _destinationChainId, uint32 _destinationEid, address _vMooneyAddress) BaseHook(_poolManager) OApp(_lzEndpoint, msg.sender) Ownable(msg.sender) {
         posm = _posm;
+        destinationChainId = _destinationChainId;
+        destinationEid = _destinationEid;
+        vMooneyAddress = _vMooneyAddress;
     }
-
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
@@ -68,76 +76,69 @@ contract Counter is BaseHook {
     // NOTE: see IHooks.sol for function documentation
     // -----------------------------------------------
 
-    function _beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata, bytes calldata)
-        internal
-        override
-        returns (bytes4, BeforeSwapDelta, uint24)
-    {
-        beforeSwapCount[key.toId()]++;
-        return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
-    }
-
     function _afterSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata _params, BalanceDelta _delta, bytes calldata)
         internal
         override
         returns (bytes4, int128)
     {
-        //(int128 amount0, int128 amount1) = (_delta.amount0(), _delta.amount1());
-        //int128 swapAmount = _params.amountSpecified < 0 == _params.zeroForOne ? amount1 : amount0;
-        //uint128 swapAmountPositive = uint128(swapAmount < 0 ? -swapAmount : swapAmount);
-        //// define swap fee
-        //// FIXME what should the swap fee be?
-        //uint128 swapFee = swapAmountPositive * 1 / 10000000; // 0.3%
+        if (_params.zeroForOne && _params.amountSpecified > 0) {
+            uint256 feeAmount = uint256(_params.amountSpecified) * uint256(key.fee) / 1e6;
+            NATIVE_FEES[key.toId()] += feeAmount;
+        }
+        if (NATIVE_FEES[key.toId()] >= MIN_WITHDRAW) {
+            bytes memory actions = abi.encodePacked(uint8(Actions.DECREASE_LIQUIDITY), uint8(Actions.TAKE_PAIR));
+            bytes[] memory params = new bytes[](2);
+            uint256 tokenId = TOKEN_ID[key.toId()];
+            params[0] = abi.encode(tokenId, 0, 0, 0, bytes(""));
+            params[1] = abi.encode(key.currency0, key.currency1, address(this));
 
-        //console.log("Swap fee: ", swapFee);
-        //console.log("contract balance", address(this).balance);
-        //poolManager.take(key.currency0, address(this), swapFee);
-        //poolManager.take(key.currency0, address(this), 0);
-        //poolManager.collect()
+            uint256 balance0Before = key.currency0.balanceOf(address(this));
+            uint256 balance1Before = key.currency1.balanceOf(address(this));
+
+            posm.modifyLiquiditiesWithoutUnlock(
+                actions, params
+            );
+
+            uint256 balance0After = key.currency0.balanceOf(address(this));
+            uint256 balance1After = key.currency1.balanceOf(address(this));
+            uint256 contractETHBalance = address(this).balance;
+
+            if (block.chainid != destinationChainId) {
+                bytes memory payload = abi.encode();
+                // Fee for messaging (assumed to be provided)
+                uint256 messageFee = msg.value;
+                uint256 totalAmount = address(this).balance;
+                uint128 GAS_LIMIT = 500000;
+                uint128 VALUE = uint128(address(this).balance);
+                bytes memory options;
+                OptionsBuilder.addExecutorLzReceiveOption(options, GAS_LIMIT, VALUE);
+
+                _lzSend(
+                    destinationEid,
+                    payload,
+                    options,
+                    MessagingFee(msg.value, 0),
+                    payable(msg.sender)
+                );
+            }
+
+        }
         return (BaseHook.afterSwap.selector, 0);
     }
 
-    function _beforeAddLiquidity(
+    function _afterAddLiquidity(
         address,
         PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata,
+        IPoolManager.ModifyLiquidityParams calldata params,
+        BalanceDelta,
+        BalanceDelta,
         bytes calldata
-    ) internal override returns (bytes4) {
-        beforeAddLiquidityCount[key.toId()]++;
-        return BaseHook.beforeAddLiquidity.selector;
+    ) internal override returns (bytes4, BalanceDelta) {
+        TOKEN_ID[key.toId()] = posm.nextTokenId() - 1;
+        return (BaseHook.beforeAddLiquidity.selector, toBalanceDelta(0, 0));
     }
 
-    function _beforeRemoveLiquidity(
-        address,
-        PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata,
-        bytes calldata
-    ) internal override returns (bytes4) {
-        beforeRemoveLiquidityCount[key.toId()]++;
-        return BaseHook.beforeRemoveLiquidity.selector;
-    }
-
-    function withdrawFees(uint256 tokenId, PoolKey calldata key, address token) external {
-        bytes memory actions = abi.encodePacked(uint8(Actions.DECREASE_LIQUIDITY), uint8(Actions.TAKE_PAIR));
-        bytes[] memory params = new bytes[](2);
-        params[0] = abi.encode(tokenId, 0, 0, 0, bytes(""));
-        params[1] = abi.encode(key.currency0, key.currency1, address(this));
-        uint256 deadline = block.timestamp + 60;
-
-        uint256 balance0Before = key.currency0.balanceOf(address(this));
-        uint256 balance1Before = key.currency1.balanceOf(address(this));
-
-        posm.modifyLiquidities(
-            abi.encode(actions, params),
-            deadline
-        );
-
-        uint256 balance0After = key.currency0.balanceOf(address(this));
-        uint256 balance1After = key.currency1.balanceOf(address(this));
-        console.log("change in balance0", balance0After - balance0Before);
-        console.log("change in balance1", balance1After - balance1Before);
-
-
+    function withdrawFees(PoolKey calldata key, address token) external {
         uint256 userBalance = IERC20(token).balanceOf(msg.sender);
         uint256 totalSupply = IERC20(token).totalSupply();
         uint256 userProportion = userBalance / totalSupply;
@@ -154,8 +155,7 @@ contract Counter is BaseHook {
         // transfer eth
         totalWithdrawnPerUser[key.toId()][msg.sender] += withdrawable;
         totalWithdrawn[key.toId()] += withdrawable;
-        console.log("withdrawable", withdrawable);
-        //transferETH(msg.sender, withdrawable);
+        transferETH(msg.sender, withdrawable);
     }
 
     function transferETH(address to, uint256 amount) internal {
@@ -164,10 +164,21 @@ contract Counter is BaseHook {
     }
 
     receive() external payable {
-    // you can leave this empty or add some logic
+        totalReceived += msg.value;
     }
 
     fallback() external payable {
+        totalReceived += msg.value;
+    }
+
+    function _lzReceive(
+        Origin calldata _origin,
+        bytes32 _guid,
+        bytes calldata payload,
+        address,  // Executor address as specified by the OApp.
+        bytes calldata  // Any extra data or options to trigger on receipt.
+    ) internal override {
+        totalReceived += msg.value;
     }
 
 }
